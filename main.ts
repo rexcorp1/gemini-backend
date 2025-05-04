@@ -38,83 +38,88 @@ interface ChatRequestBody {
 // Ini membantu dalam type safety saat memproses stream
 interface GoogleApiResponseChunk {
     candidates?: {
-        content?: {
-            parts?: TextPart[]; // Asumsi respons stream hanya teks untuk saat ini
-        };
-        finishReason?: string;
-        safetyRatings?: { category: string; probability: string }[];
+      content?: {
+        parts?: TextPart[]; // Asumsi respons stream hanya teks untuk saat ini
+      };
+      finishReason?: string;
+      safetyRatings?: { category: string; probability: string }[];
     }[];
     promptFeedback?: {
-        blockReason?: string;
-        safetyRatings?: { category: string; probability: string }[];
+      blockReason?: string;
+      safetyRatings?: { category: string; probability: string }[];
     };
-}
-
+  }
 
 // Fungsi untuk memproses stream dari Google API
 async function* processGoogleStream(stream: ReadableStream<Uint8Array>): AsyncGenerator<string> {
     const reader = stream.pipeThrough(new TextDecoderStream()).getReader();
     let buffer = "";
 
+    const processLine = (line: string): string | null => { // Helper function to process a single line
+        if (line.startsWith("data: ")) {
+            const jsonString = line.substring(6).trim();
+            if (jsonString === "") return null; // Skip empty data lines
+
+            try {
+                const chunk: GoogleApiResponseChunk = JSON.parse(jsonString);
+                const text = chunk.candidates?.[0]?.content?.parts?.[0]?.text;
+
+                // Check for finish/block reasons even if there's no text in this specific chunk
+                const finishReason = chunk.candidates?.[0]?.finishReason;
+                if (finishReason && finishReason !== 'STOP') {
+                    console.warn(`[${new Date().toISOString()}] Google API Finish Reason during stream: ${finishReason}`, chunk.candidates?.[0]?.safetyRatings ?? 'No safety ratings');
+                    // Optionally throw or handle differently
+                }
+                if (chunk.promptFeedback?.blockReason) {
+                    console.warn(`[${new Date().toISOString()}] Google API Prompt Blocked during stream: ${chunk.promptFeedback.blockReason}`, chunk.promptFeedback.safetyRatings ?? 'No safety ratings');
+                    // Optionally throw or handle differently
+                }
+
+                return text ?? null; // Return the text part, could be null/undefined
+            } catch (e) {
+                console.error(`[${new Date().toISOString()}] Failed to parse JSON chunk:`, jsonString, e);
+                return null; // Skip this chunk on error
+            }
+        } else if (line.trim() !== "") {
+            console.warn(`[${new Date().toISOString()}] Received non-data line in SSE stream:`, line);
+        }
+        return null; // Not a data line we process for text
+    };
+
     try {
         while (true) {
             const { done, value } = await reader.read();
-            if (done) {
-                if (buffer.trim()) {
-                    // Sisa buffer mungkin tidak lengkap atau error, log jika perlu
-                    console.warn(`[${new Date().toISOString()}] Streaming finished with unprocessed buffer remnant:`, buffer);
-                }
-                break;
-            }
-
-            buffer += value;
-            // Proses baris demi baris (format SSE dipisahkan oleh \n\n)
-            let eolIndex;
-            while ((eolIndex = buffer.indexOf('\n\n')) >= 0) {
-                const line = buffer.substring(0, eolIndex).trim();
-                buffer = buffer.substring(eolIndex + 2); // +2 untuk \n\n
-
-                if (line.startsWith("data: ")) {
-                    const jsonString = line.substring(6); // Hapus "data: "
-                    if (jsonString.trim() === "") continue; // Lewati baris data kosong jika ada
-
-                    try {
-                        const chunk: GoogleApiResponseChunk = JSON.parse(jsonString);
-
-                        // Ekstrak teks dari chunk (hanya bagian teks pertama dari kandidat pertama)
-                        const text = chunk.candidates?.[0]?.content?.parts?.[0]?.text;
-                        if (text) {
-                            yield text;
-                        }
-
-                        // Periksa finishReason jika ada
-                        const finishReason = chunk.candidates?.[0]?.finishReason;
-                        if (finishReason && finishReason !== 'STOP') {
-                             console.warn(`[${new Date().toISOString()}] Google API Finish Reason during stream: ${finishReason}`, chunk.candidates?.[0]?.safetyRatings ?? 'No safety ratings');
-                             // Pertimbangkan untuk melempar error atau mengirim pesan khusus ke klien
-                             // throw new Error(`Stream stopped by API due to: ${finishReason}`);
-                        }
-
-                         // Periksa promptFeedback jika ada
-                        if (chunk.promptFeedback?.blockReason) {
-                             console.warn(`[${new Date().toISOString()}] Google API Prompt Blocked during stream: ${chunk.promptFeedback.blockReason}`, chunk.promptFeedback.safetyRatings ?? 'No safety ratings');
-                             // Pertimbangkan untuk melempar error atau mengirim pesan khusus ke klien
-                             // throw new Error(`Request blocked by API due to: ${chunk.promptFeedback.blockReason}`);
-                        }
-
-                    } catch (e) {
-                        console.error(`[${new Date().toISOString()}] Failed to parse JSON chunk:`, jsonString, e);
-                        // Mungkin lewati chunk yang error atau hentikan stream tergantung kebutuhan
+            if (value) { // Process value if present
+                buffer += value;
+                let newlineIndex;
+                // Process lines separated by '\n'
+                // Note: Standard SSE uses '\n\n' to separate messages. This assumes each 'data:' line is a complete message or Google's stream format differs.
+                while ((newlineIndex = buffer.indexOf('\n')) >= 0) {
+                    const line = buffer.substring(0, newlineIndex).trim();
+                    buffer = buffer.substring(newlineIndex + 1);
+                    const textChunk = processLine(line);
+                    if (textChunk) {
+                        yield textChunk;
                     }
-                } else if (line.trim() !== "") {
-                    // Log baris yang tidak dikenal (bukan 'data:' atau kosong)
-                    console.warn(`[${new Date().toISOString()}] Received non-data line in SSE stream:`, line);
                 }
+            }
+            if (done) {
+                // Process any remaining part in the buffer after the stream is done
+                if (buffer.trim()) {
+                    const textChunk = processLine(buffer.trim());
+                    if (textChunk) {
+                        yield textChunk;
+                    } else {
+                         // Log if the remnant wasn't valid data we could parse text from
+                         console.warn(`[${new Date().toISOString()}] Streaming finished with unprocessed buffer remnant (not valid data):`, buffer.trim());
+                    }
+                }
+                break; // Exit the loop
             }
         }
     } catch (error) {
         console.error(`[${new Date().toISOString()}] Error reading or processing Google API stream:`, error);
-        throw error; // Lempar ulang agar bisa ditangani di handler utama
+        throw error; // Re-throw to be handled by the main handler
     } finally {
         reader.releaseLock(); // Pastikan reader dilepaskan
     }
