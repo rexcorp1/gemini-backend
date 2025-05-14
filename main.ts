@@ -1,7 +1,7 @@
 // main.ts
 
-import { type ConnInfo, serve } from "https://deno.land/std@0.224.0/http/server.ts"; // Gunakan versi std terbaru jika perlu
-import { type SafetySetting, type GenerationConfig } from "npm:@google/generative-ai"; // Impor tipe
+import { type ConnInfo, serve } from "https://deno.land/std@0.224.0/http/server.ts";
+import { type SafetySetting, type GenerationConfig } from "npm:@google/generative-ai";
 
 // --- Definisi Tipe untuk Multimodal ---
 interface TextPart {
@@ -22,24 +22,20 @@ interface FileDataPart {
     };
 }
 
-// Tipe Part adalah gabungan dari kemungkinan tipe bagian dalam request
 type Part = TextPart | InlineDataPart | FileDataPart;
 
-// Definisikan tipe untuk request body agar lebih jelas
 interface ChatRequestBody {
-    parts: Part[]; // Menggunakan array 'parts' untuk input pengguna
-    history: { role: string; parts: Part[] }[]; // History juga menggunakan Part[]
+    parts: Part[];
+    history: { role: string; parts: Part[] }[];
     model: string;
-    generationConfig?: GenerationConfig; // Opsional
-    safetySettings?: SafetySetting[];   // Opsional
+    generationConfig?: GenerationConfig;
+    safetySettings?: SafetySetting[];
 }
 
-// --- Tipe Internal untuk Google API Response (untuk parsing JSON) ---
-// Ini membantu dalam type safety saat memproses stream
 interface GoogleApiResponseChunk {
     candidates?: {
       content?: {
-        parts?: TextPart[]; // Asumsi respons stream hanya teks untuk saat ini
+        parts?: TextPart[];
       };
       finishReason?: string;
       safetyRatings?: { category: string; probability: string }[];
@@ -48,92 +44,74 @@ interface GoogleApiResponseChunk {
       blockReason?: string;
       safetyRatings?: { category: string; probability: string }[];
     };
-  }
+}
 
-// Fungsi untuk memproses stream dari Google API
 async function* processGoogleStream(stream: ReadableStream<Uint8Array>): AsyncGenerator<string> {
     const reader = stream.pipeThrough(new TextDecoderStream()).getReader();
     let buffer = "";
 
-    const processLine = (line: string): string | null => { // Helper function to process a single line
+    const extractTextFromDataLine = (line: string): string | null => {
         if (line.startsWith("data: ")) {
             const jsonString = line.substring(6).trim();
-            if (jsonString === "") return null; // Skip empty data lines
+            if (jsonString === "") return null;
 
             try {
-                const chunk: GoogleApiResponseChunk = JSON.parse(jsonString);
+                const chunk = JSON.parse(jsonString) as GoogleApiResponseChunk;
                 const text = chunk.candidates?.[0]?.content?.parts?.[0]?.text;
 
-                // Check for finish/block reasons even if there's no text in this specific chunk
                 const finishReason = chunk.candidates?.[0]?.finishReason;
                 if (finishReason && finishReason !== 'STOP') {
                     console.warn(`[${new Date().toISOString()}] Google API Finish Reason during stream: ${finishReason}`, chunk.candidates?.[0]?.safetyRatings ?? 'No safety ratings');
-                    // Optionally throw or handle differently
                 }
                 if (chunk.promptFeedback?.blockReason) {
                     console.warn(`[${new Date().toISOString()}] Google API Prompt Blocked during stream: ${chunk.promptFeedback.blockReason}`, chunk.promptFeedback.safetyRatings ?? 'No safety ratings');
-                    // Optionally throw or handle differently
                 }
-
-                return text ?? null; // Return the text part, could be null/undefined
+                return text ?? null;
             } catch (e) {
                 console.error(`[${new Date().toISOString()}] Failed to parse JSON chunk:`, jsonString, e);
-                return null; // Skip this chunk on error
+                return null;
             }
         } else if (line.trim() !== "") {
             console.warn(`[${new Date().toISOString()}] Received non-data line in SSE stream:`, line);
         }
-        return null; // Not a data line we process for text
+        return null;
     };
 
     try {
         while (true) {
             const { done, value } = await reader.read();
-            if (value) { // Process value if present
+            if (value) {
                 buffer += value;
                 let newlineIndex;
-                // Process lines separated by '\n'
-                // Note: Standard SSE uses '\n\n' to separate messages. This assumes each 'data:' line is a complete message or Google's stream format differs.
                 while ((newlineIndex = buffer.indexOf('\n')) >= 0) {
-                    const line = buffer.substring(0, newlineIndex).trim();
+                    const singleLine = buffer.substring(0, newlineIndex);
                     buffer = buffer.substring(newlineIndex + 1);
-                    const textChunk = processLine(line);
-                    if (textChunk) {
+                    const textChunk = extractTextFromDataLine(singleLine.trim());
+                    if (textChunk !== null && textChunk !== undefined) {
                         yield textChunk;
                     }
                 }
             }
             if (done) {
-                // Process any remaining part in the buffer after the stream is done
                 if (buffer.trim()) {
-                    const textChunk = processLine(buffer.trim());
-                    if (textChunk) {
+                    const textChunk = extractTextFromDataLine(buffer.trim());
+                    if (textChunk !== null && textChunk !== undefined) {
                         yield textChunk;
                     } else {
-                         // Log if the remnant wasn't valid data we could parse text from
                          console.warn(`[${new Date().toISOString()}] Streaming finished with unprocessed buffer remnant (not valid data):`, buffer.trim());
                     }
                 }
-                break; // Exit the loop
+                break;
             }
         }
     } catch (error) {
         console.error(`[${new Date().toISOString()}] Error reading or processing Google API stream:`, error);
-        throw error; // Re-throw to be handled by the main handler
+        throw error;
     } finally {
-        reader.releaseLock(); // Pastikan reader dilepaskan
+        reader.releaseLock();
     }
 }
 
-// Fungsi pembantu untuk membuat respons error JSON
-function createErrorResponse(message: string, status: number): Response {
-    return new Response(JSON.stringify({ error: message }), {
-        status: status,
-        headers: { 'Content-Type': 'application/json' },
-    });
-}
-
-// Fungsi pembantu untuk validasi struktur Part
 function isValidPart(part: unknown): part is Part {
     if (typeof part !== 'object' || part === null) return false;
     const hasText = 'text' in part && typeof (part as TextPart).text === 'string';
@@ -150,24 +128,58 @@ function isValidPart(part: unknown): part is Part {
     return hasText || hasInlineData || hasFileData;
 }
 
-// Handler utama untuk request HTTP
 async function handler(req: Request, _connInfo: ConnInfo): Promise<Response> {
     const requestStartTime = Date.now();
     console.log(`[${new Date(requestStartTime).toISOString()}] Received request: ${req.method} ${req.url}`);
 
-    if (req.method !== 'POST') {
-        return createErrorResponse(`Method ${req.method} Not Allowed`, 405);
+    // --- CORS Headers ---
+    // Untuk development, izinkan localhost. Untuk production, ganti dengan domain frontend lo.
+    // Atau baca dari environment variable.
+    const requestOrigin = req.headers.get("origin");
+    let allowedOrigin = "null"; // Default jika origin tidak diizinkan atau tidak ada
+
+    // Daftar origin yang diizinkan (bisa diperluas atau dibaca dari env var)
+    const allowedOriginsList = [
+        "http://localhost:8000", // Untuk development frontend lokal
+        // "https://your-production-frontend.com" // Tambahkan domain production lo di sini
+    ];
+
+    if (requestOrigin && allowedOriginsList.includes(requestOrigin)) {
+        allowedOrigin = requestOrigin;
     }
 
-    // Periksa Content-Type
-    if (req.headers.get("content-type")?.split(';')[0] !== 'application/json') {
-         return createErrorResponse("Invalid Content-Type. Expected application/json", 415);
+    const corsHeaders = {
+        'Access-Control-Allow-Origin': allowedOrigin,
+        'Access-Control-Allow-Methods': 'POST, OPTIONS',
+        'Access-Control-Allow-Headers': 'Content-Type, Authorization', // Tambahkan header lain jika perlu
+    };
+
+    // Handle preflight OPTIONS request
+    if (req.method === 'OPTIONS') {
+        return new Response(null, { status: 204, headers: corsHeaders });
+    }
+
+    if (req.method !== 'POST') {
+        return new Response(JSON.stringify({ error: `Method ${req.method} Not Allowed` }), {
+            status: 405,
+            headers: { ...corsHeaders, 'Content-Type': 'application/json' },
+        });
     }
 
     const apiKey = Deno.env.get("GEMINI_API_KEY");
     if (!apiKey) {
         console.error("FATAL: GEMINI_API_KEY environment variable not set.");
-        return createErrorResponse("Server configuration error: API key missing.", 500);
+        return new Response(JSON.stringify({ error: "Server configuration error: API key missing." }), {
+            status: 500,
+            headers: { ...corsHeaders, 'Content-Type': 'application/json' },
+        });
+    }
+
+    if (req.headers.get("content-type")?.split(';')[0] !== 'application/json') {
+        return new Response(JSON.stringify({ error: "Invalid Content-Type. Expected application/json" }), {
+            status: 415,
+            headers: { ...corsHeaders, 'Content-Type': 'application/json' },
+        });
     }
 
     let body: ChatRequestBody;
@@ -175,104 +187,88 @@ async function handler(req: Request, _connInfo: ConnInfo): Promise<Response> {
         body = await req.json();
     } catch (e) {
         console.error(`[${new Date().toISOString()}] Failed to parse request body:`, e);
-        return createErrorResponse("Invalid JSON in request body.", 400);
+        return new Response(JSON.stringify({ error: "Invalid JSON in request body." }), {
+            status: 400,
+            headers: { ...corsHeaders, 'Content-Type': 'application/json' },
+        });
     }
 
-    // Destructuring dengan nama yang lebih jelas
     const { parts: userParts, history, model, generationConfig, safetySettings } = body;
 
-    // --- Validasi Input yang Lebih Rinci ---
     if (!model || typeof model !== 'string') {
-        return createErrorResponse("Missing or invalid required field: model (string)", 400);
+        return new Response(JSON.stringify({ error: "Missing or invalid required field: model (string)" }), { status: 400, headers: { ...corsHeaders, 'Content-Type': 'application/json' } });
     }
     if (!Array.isArray(userParts) || userParts.length === 0) {
-        return createErrorResponse("Missing or invalid required field: parts (non-empty array)", 400);
+        return new Response(JSON.stringify({ error: "Missing or invalid required field: parts (non-empty array)" }), { status: 400, headers: { ...corsHeaders, 'Content-Type': 'application/json' } });
     }
     if (!userParts.every(isValidPart)) {
          console.error("Bad Request: Invalid structure in user parts array", userParts);
-         return createErrorResponse("Invalid structure in parts array. Each part must contain valid 'text', 'inlineData', or 'fileData'.", 400);
+         return new Response(JSON.stringify({ error: "Invalid structure in parts array. Each part must contain valid 'text', 'inlineData', or 'fileData'." }), { status: 400, headers: { ...corsHeaders, 'Content-Type': 'application/json' } });
     }
     if (!Array.isArray(history)) {
-         return createErrorResponse("Missing or invalid required field: history (array)", 400);
+         return new Response(JSON.stringify({ error: "Missing or invalid required field: history (array)" }), { status: 400, headers: { ...corsHeaders, 'Content-Type': 'application/json' } });
     }
-    // Validasi struktur history (lebih ketat)
     if (!history.every(item =>
         item && typeof item.role === 'string' && (item.role === 'user' || item.role === 'model') &&
         Array.isArray(item.parts) && item.parts.every(isValidPart)
     )) {
-         console.error("Bad Request: Invalid structure in history array", history);
-         return createErrorResponse("Invalid structure in history array. Each item must have role ('user' or 'model') and an array of valid parts.", 400);
+        console.error("Bad Request: Invalid structure in history array", history);
+        return new Response(JSON.stringify({ error: "Invalid structure in history array. Each item must have role ('user' or 'model') and an array of valid parts." }), { status: 400, headers: { ...corsHeaders, 'Content-Type': 'application/json' } });
     }
-    // Validasi opsional (contoh: pastikan generationConfig adalah objek jika ada)
     if (generationConfig !== undefined && typeof generationConfig !== 'object') {
-        return createErrorResponse("Invalid optional field: generationConfig must be an object if provided.", 400);
+        return new Response(JSON.stringify({ error: "Invalid optional field: generationConfig must be an object if provided." }), { status: 400, headers: { ...corsHeaders, 'Content-Type': 'application/json' } });
     }
     if (safetySettings !== undefined && !Array.isArray(safetySettings)) {
-        return createErrorResponse("Invalid optional field: safetySettings must be an array if provided.", 400);
+        return new Response(JSON.stringify({ error: "Invalid optional field: safetySettings must be an array if provided." }), { status: 400, headers: { ...corsHeaders, 'Content-Type': 'application/json' } });
     }
-    // TODO: Tambahkan validasi lebih dalam untuk safetySettings jika perlu
 
-
-    // Gunakan endpoint streaming
     const googleApiEndpoint = `https://generativelanguage.googleapis.com/v1beta/models/${model}:streamGenerateContent?key=${apiKey}&alt=sse`;
 
     const payload = {
         contents: [
-            ...history, // Sertakan history sebelumnya
-            {
-                role: "user",
-                parts: userParts // Gunakan parts dari request saat ini
-            }
+            ...history,
+            { role: "user", parts: userParts }
         ],
-        // Sertakan konfigurasi hanya jika ada di request
         ...(generationConfig && { generationConfig }),
         ...(safetySettings && { safetySettings }),
     };
 
     console.log(`[${new Date().toISOString()}] Forwarding to Google API (Streaming): ${googleApiEndpoint.split('?')[0]} for model ${model} with ${userParts.length} user parts.`);
-    // console.debug("Payload:", JSON.stringify(payload)); // Hati-hati log data base64 yang besar
 
     try {
         const googleApiResponse = await fetch(googleApiEndpoint, {
             method: 'POST',
-            headers: {
-                'Content-Type': 'application/json',
-                // Pertimbangkan menambahkan User-Agent kustom
-                // 'User-Agent': 'MyDenoApp/1.0'
-            },
+            headers: { 'Content-Type': 'application/json' },
             body: JSON.stringify(payload),
-            signal: AbortSignal.timeout(90000) // Timeout lebih lama untuk streaming (90 detik)
+            signal: AbortSignal.timeout(90000)
         });
 
         if (!googleApiResponse.ok || !googleApiResponse.body) {
-             // Coba baca body error jika ada untuk logging yang lebih baik
-             let errorBodyText = await googleApiResponse.text(); // Baca sebagai teks dulu
+             let errorBodyText = await googleApiResponse.text();
              let errorJson = null;
-             let errorMessage = googleApiResponse.statusText; // Default message
+             let errorMessage = googleApiResponse.statusText;
              try {
                  errorJson = JSON.parse(errorBodyText);
-                 errorMessage = errorJson?.error?.message || errorMessage; // Coba ambil pesan dari JSON
+                 errorMessage = errorJson?.error?.message || errorMessage;
                  console.error(`[${new Date().toISOString()}] Google API Error (${googleApiResponse.status}):`, errorJson);
              } catch (e) {
-                 // Jika body bukan JSON atau kosong
                  console.error(`[${new Date().toISOString()}] Google API Error (${googleApiResponse.status}): ${errorBodyText || '<empty body>'}`);
-                 if (errorBodyText) errorMessage = errorBodyText; // Gunakan teks jika bukan JSON
+                 if (errorBodyText) errorMessage = errorBodyText;
              }
-
-            // Kembalikan error ke klien
-            return createErrorResponse(`Google API Error: ${errorMessage}`, googleApiResponse.status); // Gunakan status code dari Google
+            return new Response(JSON.stringify({ error: `Google API Error: ${errorMessage}` }), {
+                status: googleApiResponse.status,
+                headers: { ...corsHeaders, 'Content-Type': 'application/json' },
+            });
         }
 
         console.log(`[${new Date().toISOString()}] Google API Streaming Success Response (${googleApiResponse.status}) received for model ${model}. Starting stream processing.`);
 
-        // Buat ReadableStream untuk respons Deno
         const responseStream = new ReadableStream({
             async start(controller) {
                 const streamStartTime = Date.now();
                 try {
                     const encoder = new TextEncoder();
                     for await (const textChunk of processGoogleStream(googleApiResponse.body!)) {
-                        // console.debug("Yielding chunk:", textChunk); // Untuk debugging stream
                         controller.enqueue(encoder.encode(textChunk));
                     }
                     controller.close();
@@ -281,33 +277,26 @@ async function handler(req: Request, _connInfo: ConnInfo): Promise<Response> {
                 } catch (streamError) {
                      const streamEndTime = Date.now();
                      console.error(`[${new Date().toISOString()}] Error processing Google stream or writing to response:`, streamError, `Stream active for ${streamEndTime - streamStartTime}ms`);
-                     // Coba kirim pesan error ke client jika stream masih terbuka dan belum error
-                     if (!controller.desiredSize === null || controller.desiredSize > 0) {
+                     if (controller.desiredSize === null || (controller.desiredSize && controller.desiredSize > 0)) { // Perbaikan kondisi
                          try {
-                             // Format error sebagai teks biasa atau JSON, tergantung preferensi klien
                              const errorMsg = `\n[STREAM_ERROR] Processing failed: ${streamError.message}\n`;
                              controller.enqueue(new TextEncoder().encode(errorMsg));
                          } catch (enqueueError) {
                              console.error("Failed to enqueue stream error message:", enqueueError);
                          }
                      }
-                     // Tutup stream dengan error agar klien tahu ada masalah
                      controller.error(streamError);
                 }
             }
         });
 
-        // Kirim stream sebagai respons
         return new Response(responseStream, {
-            status: 200, // Sukses memulai streaming
+            status: 200,
             headers: {
-                'Content-Type': 'text/plain; charset=utf-8', // Kirim sebagai teks biasa, potongan demi potongan
+                ...corsHeaders,
+                'Content-Type': 'text/plain; charset=utf-8',
                 'X-Content-Type-Options': 'nosniff',
-                'Cache-Control': 'no-cache', // Penting untuk streaming
-                // Jika Anda ingin format SSE dari server Deno ke klien:
-                // 'Content-Type': 'text/event-stream; charset=utf-8',
-                // Dan ubah enqueue di atas menjadi format SSE:
-                // controller.enqueue(encoder.encode(`data: ${JSON.stringify({text: textChunk})}\n\n`));
+                'Cache-Control': 'no-cache',
             }
         });
 
@@ -318,19 +307,20 @@ async function handler(req: Request, _connInfo: ConnInfo): Promise<Response> {
         let message = `Internal Server Error: ${error.message}`;
 
         if (error.name === 'TimeoutError') {
-            status = 504; // Gateway Timeout
+            status = 504;
             message = 'Request to Google API timed out.';
         } else if (error.message.startsWith('Stream stopped by API due to:') || error.message.startsWith('Request blocked by API due to:')) {
-             // Jika error dilempar dari processGoogleStream karena alasan API
-             status = 400; // Atau 502 Bad Gateway, tergantung bagaimana Anda menginterpretasikannya
+             status = 400;
              message = error.message;
          }
 
-        return createErrorResponse(message, status);
+        return new Response(JSON.stringify({ error: message }), {
+            status: status,
+            headers: { ...corsHeaders, 'Content-Type': 'application/json' },
+        });
     }
 }
 
-// Jalankan server
-const port = 8000;
+const port = 8000; // Pastikan port ini tidak konflik dengan port frontend (jika dijalankan di mesin yang sama)
 console.log(`Chat server starting on http://localhost:${port}`);
 serve(handler, { port });
