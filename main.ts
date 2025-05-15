@@ -140,8 +140,8 @@ async function handler(req: Request, _connInfo: ConnInfo): Promise<Response> {
 
     // Daftar origin yang diizinkan (bisa diperluas atau dibaca dari env var)
     const allowedOriginsList = [
-        "http://localhost:8000", // Untuk development frontend lokal
-        // "https://your-production-frontend.com" // Tambahkan domain production lo di sini
+        "http://localhost:8000",
+        "https://gemini2-ashen.vercel.app"
     ];
 
     if (requestOrigin && allowedOriginsList.includes(requestOrigin)) {
