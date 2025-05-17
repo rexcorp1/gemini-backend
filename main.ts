@@ -1,5 +1,5 @@
 import { type ConnInfo, serve } from "https://deno.land/std@0.224.0/http/server.ts";
-import { encode as base64Encode } from "https://deno.land/std@0.224.0/encoding/base64.ts";
+import * as base64 from "https://deno.land/std@0.224.0/encoding/base64.ts";
 import { type SafetySetting, type GenerationConfig } from "npm:@google/generative-ai";
 
 interface TextPart {
@@ -128,7 +128,7 @@ function isValidPart(part: unknown): part is Part {
 
 function customEncodeToString(src: Uint8Array | string): string {
   const localDecoder = new TextDecoder();
-  return localDecoder.decode(base64Encode(src));
+  return localDecoder.decode(base64.encode(src));
 }
 
 async function handler(req: Request, _connInfo: ConnInfo): Promise<Response> {
