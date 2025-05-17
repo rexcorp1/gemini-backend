@@ -1,8 +1,7 @@
 import { type ConnInfo, serve } from "https://deno.land/std@0.224.0/http/server.ts";
-import { type SafetySetting, type GenerationConfig } from "npm:@google/generative-ai";
-import { Pdfparser } from "https://deno.land/x/pdfparser@v1.2.4/mod.ts";
+import { type SafetySetting, type GenerationConfig, GoogleGenerativeAI } from "npm:@google/generative-ai";
+import * as pdfjsLib from "npm:pdfjs-dist@4.4.168";
 
-// --- Type Definitions ---
 interface TextPart {
     text: string;
 }
@@ -14,7 +13,7 @@ interface InlineDataPart {
     };
 }
 
-interface FileDataPart { // This type is defined but not directly used for sending to Gemini in this setup
+interface FileDataPart {
     fileData: {
         mimeType: string;
         fileUri: string;
@@ -45,7 +44,6 @@ interface GoogleApiResponseChunk {
     };
 }
 
-// --- Stream Processing ---
 async function* processGoogleStream(stream: ReadableStream<Uint8Array>): AsyncGenerator<string> {
     const reader = stream.pipeThrough(new TextDecoderStream()).getReader();
     let buffer = "";
@@ -112,7 +110,6 @@ async function* processGoogleStream(stream: ReadableStream<Uint8Array>): AsyncGe
     }
 }
 
-// --- Utility Functions ---
 function isValidPart(part: unknown): part is Part {
     if (typeof part !== 'object' || part === null) return false;
     const hasText = 'text' in part && typeof (part as TextPart).text === 'string';
@@ -141,7 +138,20 @@ function customEncodeToString(src: Uint8Array | string | ArrayBuffer): string {
   return btoa(bin);
 }
 
-// --- Main Request Handler ---
+async function extractTextFromPdf(pdfBuffer: ArrayBuffer): Promise<string> {
+    const loadingTask = pdfjsLib.getDocument({ data: pdfBuffer });
+    const pdf = await loadingTask.promise;
+    let fullText = "";
+    for (let i = 1; i <= pdf.numPages; i++) {
+        const page = await pdf.getPage(i);
+        const textContent = await page.getTextContent();
+        const pageText = textContent.items.map(item => (item as any).str).join(" ");
+        fullText += pageText + "\n";
+    }
+    return fullText.replace(/\s+/g, ' ').trim();
+}
+
+
 async function handler(req: Request, _connInfo: ConnInfo): Promise<Response> {
     const requestStartTime = Date.now();
     console.log(`[${new Date(requestStartTime).toISOString()}] Received request: ${req.method} ${req.url}`);
@@ -206,7 +216,6 @@ async function handler(req: Request, _connInfo: ConnInfo): Promise<Response> {
     const processedUserParts: Part[] = [];
     const fileRefRegex = /\[File Ref: (https?:\/\/[^\]]+)\]/g;
 
-    // Define supported text-based MIME types for direct text extraction
     const supportedTextMimeTypes = [
         "text/plain",
         "text/markdown",
@@ -214,7 +223,6 @@ async function handler(req: Request, _connInfo: ConnInfo): Promise<Response> {
         "text/csv",
         "application/json",
         "application/xml",
-        // Add other simple text-based formats here
     ];
 
     for (const part of userParts) {
@@ -241,7 +249,7 @@ async function handler(req: Request, _connInfo: ConnInfo): Promise<Response> {
                         continue;
                     }
 
-                    const contentType = fileResponse.headers.get("content-type")?.split(';')[0].trim(); // Get base MIME type
+                    const contentType = fileResponse.headers.get("content-type")?.split(';')[0].trim();
 
                     if (contentType && contentType.startsWith("image/")) {
                         const imageBuffer = await fileResponse.arrayBuffer();
@@ -257,18 +265,7 @@ async function handler(req: Request, _connInfo: ConnInfo): Promise<Response> {
                         console.log(`[${new Date().toISOString()}] Image processed and added as inlineData: ${fileUrl}`);
                     } else if (contentType === "application/pdf") {
                         const pdfBuffer = await fileResponse.arrayBuffer();
-                        const pdfText = await new Promise<string>((resolve, reject) => {
-                            const pdfparser = new Pdfparser();
-                            pdfparser.on("pdfParser_dataError", (errData: any) => {
-                                console.error(`[${new Date().toISOString()}] PDFParser error for ${fileUrl}:`, errData.parserError);
-                                reject(new Error(errData.parserError || "Unknown PDF parsing error"));
-                            });
-                            pdfparser.on("pdfParser_dataReady", () => {
-                                const extractedText = pdfparser.getRawTextContent();
-                                resolve(extractedText.replace(/\s+/g, ' ').trim());
-                            });
-                            pdfparser.parseBuffer(new Uint8Array(pdfBuffer));
-                        });
+                        const pdfText = await extractTextFromPdf(pdfBuffer);
                         if (textSegments.length > 0) {
                             const combinedTextSegment = textSegments.join("").trim();
                             if (combinedTextSegment) processedUserParts.push({ text: combinedTextSegment });
@@ -306,7 +303,7 @@ async function handler(req: Request, _connInfo: ConnInfo): Promise<Response> {
                 const finalTextSegment = textSegments.join("").trim();
                 if (finalTextSegment) processedUserParts.push({ text: finalTextSegment });
             }
-        } else { // If the part is not text (e.g., already inlineData from client), pass it through
+        } else {
             processedUserParts.push(part);
         }
     }
