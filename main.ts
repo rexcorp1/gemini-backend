@@ -1,6 +1,8 @@
 import { type ConnInfo, serve } from "https://deno.land/std@0.224.0/http/server.ts";
 import { type SafetySetting, type GenerationConfig } from "npm:@google/generative-ai";
+import { Pdfparser } from "https://deno.land/x/pdfparser@v1.2.4/mod.ts";
 
+// --- Type Definitions ---
 interface TextPart {
     text: string;
 }
@@ -12,7 +14,7 @@ interface InlineDataPart {
     };
 }
 
-interface FileDataPart {
+interface FileDataPart { // This type is defined but not directly used for sending to Gemini in this setup
     fileData: {
         mimeType: string;
         fileUri: string;
@@ -43,6 +45,7 @@ interface GoogleApiResponseChunk {
     };
 }
 
+// --- Stream Processing ---
 async function* processGoogleStream(stream: ReadableStream<Uint8Array>): AsyncGenerator<string> {
     const reader = stream.pipeThrough(new TextDecoderStream()).getReader();
     let buffer = "";
@@ -109,6 +112,7 @@ async function* processGoogleStream(stream: ReadableStream<Uint8Array>): AsyncGe
     }
 }
 
+// --- Utility Functions ---
 function isValidPart(part: unknown): part is Part {
     if (typeof part !== 'object' || part === null) return false;
     const hasText = 'text' in part && typeof (part as TextPart).text === 'string';
@@ -125,11 +129,11 @@ function isValidPart(part: unknown): part is Part {
     return hasText || hasInlineData || hasFileData;
 }
 
-function customEncodeToString(src: Uint8Array | string): string {
+function customEncodeToString(src: Uint8Array | string | ArrayBuffer): string {
   if (typeof src === 'string') {
     return btoa(src);
   }
-  const byteArray = new Uint8Array(src);
+  const byteArray = (src instanceof Uint8Array) ? src : new Uint8Array(src);
   let bin = '';
   byteArray.forEach((byte) => {
     bin += String.fromCharCode(byte);
@@ -137,6 +141,7 @@ function customEncodeToString(src: Uint8Array | string): string {
   return btoa(bin);
 }
 
+// --- Main Request Handler ---
 async function handler(req: Request, _connInfo: ConnInfo): Promise<Response> {
     const requestStartTime = Date.now();
     console.log(`[${new Date(requestStartTime).toISOString()}] Received request: ${req.method} ${req.url}`);
@@ -198,9 +203,19 @@ async function handler(req: Request, _connInfo: ConnInfo): Promise<Response> {
     }
 
     const { parts: userParts, history, model, generationConfig, safetySettings } = body;
-
     const processedUserParts: Part[] = [];
-    const imageRefRegex = /\[File Ref: (https?:\/\/[^\]]+)\]/g;
+    const fileRefRegex = /\[File Ref: (https?:\/\/[^\]]+)\]/g;
+
+    // Define supported text-based MIME types for direct text extraction
+    const supportedTextMimeTypes = [
+        "text/plain",
+        "text/markdown",
+        "text/html",
+        "text/csv",
+        "application/json",
+        "application/xml",
+        // Add other simple text-based formats here
+    ];
 
     for (const part of userParts) {
         if (part.text) {
@@ -209,45 +224,79 @@ async function handler(req: Request, _connInfo: ConnInfo): Promise<Response> {
             const textSegments: string[] = [];
             let originalTextForPart = part.text;
 
-            while ((match = imageRefRegex.exec(originalTextForPart)) !== null) {
+            while ((match = fileRefRegex.exec(originalTextForPart)) !== null) {
                 if (match.index > lastIndex) {
                     textSegments.push(originalTextForPart.substring(lastIndex, match.index));
                 }
-                const imageUrl = match[1];
-                lastIndex = imageRefRegex.lastIndex;
+                const fileUrl = match[1];
+                lastIndex = fileRefRegex.lastIndex;
 
                 try {
-                    console.log(`[${new Date().toISOString()}] Fetching image from URL: ${imageUrl}`);
-                    const imageResponse = await fetch(imageUrl);
+                    console.log(`[${new Date().toISOString()}] Fetching file from URL: ${fileUrl}`);
+                    const fileResponse = await fetch(fileUrl);
 
-                    if (!imageResponse.ok) {
-                        console.warn(`[${new Date().toISOString()}] Failed to fetch image ${imageUrl}: ${imageResponse.status}`);
-                        textSegments.push(` [Failed to load image: ${imageResponse.statusText}] `);
+                    if (!fileResponse.ok) {
+                        console.warn(`[${new Date().toISOString()}] Failed to fetch file ${fileUrl}: ${fileResponse.status}`);
+                        textSegments.push(` [Gagal memuat file: ${fileResponse.statusText}] `);
                         continue;
                     }
 
-                    const contentType = imageResponse.headers.get("content-type");
-                    if (!contentType || !contentType.startsWith("image/")) {
-                        console.warn(`[${new Date().toISOString()}] Fetched content from ${imageUrl} is not an image: ${contentType}`);
-                        textSegments.push(` [Invalid image content: ${contentType}] `);
-                        continue;
+                    const contentType = fileResponse.headers.get("content-type")?.split(';')[0].trim(); // Get base MIME type
+
+                    if (contentType && contentType.startsWith("image/")) {
+                        const imageBuffer = await fileResponse.arrayBuffer();
+                        const base64Data = customEncodeToString(imageBuffer);
+                        if (textSegments.length > 0) {
+                            const combinedTextSegment = textSegments.join("").trim();
+                            if (combinedTextSegment) processedUserParts.push({ text: combinedTextSegment });
+                            textSegments.length = 0;
+                        }
+                        processedUserParts.push({
+                            inlineData: { mimeType: contentType, data: base64Data },
+                        });
+                        console.log(`[${new Date().toISOString()}] Image processed and added as inlineData: ${fileUrl}`);
+                    } else if (contentType === "application/pdf") {
+                        const pdfBuffer = await fileResponse.arrayBuffer();
+                        const pdfText = await new Promise<string>((resolve, reject) => {
+                            const pdfparser = new Pdfparser();
+                            pdfparser.on("pdfParser_dataError", (errData: any) => {
+                                console.error(`[${new Date().toISOString()}] PDFParser error for ${fileUrl}:`, errData.parserError);
+                                reject(new Error(errData.parserError || "Unknown PDF parsing error"));
+                            });
+                            pdfparser.on("pdfParser_dataReady", () => {
+                                const extractedText = pdfparser.getRawTextContent();
+                                resolve(extractedText.replace(/\s+/g, ' ').trim());
+                            });
+                            pdfparser.parseBuffer(new Uint8Array(pdfBuffer));
+                        });
+                        if (textSegments.length > 0) {
+                            const combinedTextSegment = textSegments.join("").trim();
+                            if (combinedTextSegment) processedUserParts.push({ text: combinedTextSegment });
+                            textSegments.length = 0;
+                        }
+                        const fileContentPrefix = `\n\n--- Isi Dokumen PDF (${fileUrl}) ---\n`;
+                        const fileContentSuffix = "\n--- Akhir Isi Dokumen PDF ---\n\n";
+                        processedUserParts.push({ text: `${fileContentPrefix}${pdfText}${fileContentSuffix}` });
+                        console.log(`[${new Date().toISOString()}] Extracted text from PDF: ${fileUrl}`);
+                    } else if (contentType && supportedTextMimeTypes.includes(contentType)) {
+                        const textContent = await fileResponse.text();
+                         if (textSegments.length > 0) {
+                            const combinedTextSegment = textSegments.join("").trim();
+                            if (combinedTextSegment) processedUserParts.push({ text: combinedTextSegment });
+                            textSegments.length = 0;
+                        }
+                        const fileContentPrefix = `\n\n--- Isi Dokumen Teks (${contentType} - ${fileUrl}) ---\n`;
+                        const fileContentSuffix = "\n--- Akhir Isi Dokumen Teks ---\n\n";
+                        processedUserParts.push({ text: `${fileContentPrefix}${textContent.trim()}${fileContentSuffix}` });
+                        console.log(`[${new Date().toISOString()}] Extracted text from ${contentType}: ${fileUrl}`);
                     }
-
-                    const imageBuffer = await imageResponse.arrayBuffer(); // This is an ArrayBuffer
-                    const base64Data = customEncodeToString(imageBuffer); // Use the updated function
-
-                    if (textSegments.length > 0) {
-                        const combinedTextSegment = textSegments.join("").trim();
-                        if (combinedTextSegment) processedUserParts.push({ text: combinedTextSegment });
-                        textSegments.length = 0;
+                    else {
+                        console.warn(`[${new Date().toISOString()}] Unsupported file type ${contentType} from URL: ${fileUrl}`);
+                        textSegments.push(` [Tipe file tidak didukung: ${contentType || 'tidak diketahui'}] `);
                     }
-
-                    processedUserParts.push({
-                        inlineData: { mimeType: contentType, data: base64Data },
-                    });
                 } catch (fetchError) {
-                    console.error(`[${new Date().toISOString()}] Error fetching or processing image ${imageUrl}:`, fetchError);
-                    textSegments.push(` [Error processing image: ${fetchError.message}] `);
+                    console.error(`[${new Date().toISOString()}] Error fetching or processing file ${fileUrl}:`, fetchError);
+                    textSegments.push(` [Gagal memproses file: ${fetchError.message}] `);
                 }
             }
             if (lastIndex < originalTextForPart.length) {
@@ -257,7 +306,7 @@ async function handler(req: Request, _connInfo: ConnInfo): Promise<Response> {
                 const finalTextSegment = textSegments.join("").trim();
                 if (finalTextSegment) processedUserParts.push({ text: finalTextSegment });
             }
-        } else {
+        } else { // If the part is not text (e.g., already inlineData from client), pass it through
             processedUserParts.push(part);
         }
     }
@@ -265,16 +314,13 @@ async function handler(req: Request, _connInfo: ConnInfo): Promise<Response> {
     if (!model || typeof model !== 'string') {
         return new Response(JSON.stringify({ error: "Missing or invalid required field: model (string)" }), { status: 400, headers: { ...corsHeaders, 'Content-Type': 'application/json' } });
     }
-    // Validate userParts *after* processing, as processedUserParts might be empty if only an image was sent and failed to process
     if (processedUserParts.length === 0 && (!userParts || userParts.length === 0 || !userParts.some(p => p.text && p.text.trim() !== ''))) {
         return new Response(JSON.stringify({ error: "Missing or invalid required field: parts (non-empty array after processing)" }), { status: 400, headers: { ...corsHeaders, 'Content-Type': 'application/json' } });
     }
-    // Original userParts validation (can be kept for sanity check or removed if processedUserParts validation is sufficient)
     if (!Array.isArray(userParts) || !userParts.every(isValidPart)) {
          console.error("Bad Request: Invalid structure in original user parts array", userParts);
          return new Response(JSON.stringify({ error: "Invalid structure in original parts array. Each part must contain valid 'text', 'inlineData', or 'fileData'." }), { status: 400, headers: { ...corsHeaders, 'Content-Type': 'application/json' } });
     }
-
     if (!Array.isArray(history)) {
          return new Response(JSON.stringify({ error: "Missing or invalid required field: history (array)" }), { status: 400, headers: { ...corsHeaders, 'Content-Type': 'application/json' } });
     }
@@ -296,8 +342,8 @@ async function handler(req: Request, _connInfo: ConnInfo): Promise<Response> {
 
     const payload = {
         contents: [
-            ...history, // Consider processing history parts for images too if needed
-            { role: "user", parts: processedUserParts.length > 0 ? processedUserParts : userParts } // Use processed parts
+            ...history,
+            { role: "user", parts: processedUserParts.length > 0 ? processedUserParts : userParts }
         ],
         ...(generationConfig && { generationConfig }),
         ...(safetySettings && { safetySettings }),
