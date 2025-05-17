@@ -127,14 +127,14 @@ function isValidPart(part: unknown): part is Part {
 
 function customEncodeToString(src: Uint8Array | string): string {
   if (typeof src === 'string') {
-    return btoa(src); // Directly use btoa if the input is already a string
+    return btoa(src);
   }
-  // If the input is Uint8Array, convert it to a binary string first
+  const byteArray = new Uint8Array(src);
   let bin = '';
-  src.forEach((byte) => { // Iterate over each byte in the Uint8Array
-    bin += String.fromCharCode(byte); // Convert the byte to its character representation
+  byteArray.forEach((byte) => {
+    bin += String.fromCharCode(byte);
   });
-  return btoa(bin); // Then, Base64 encode the binary string
+  return btoa(bin);
 }
 
 async function handler(req: Request, _connInfo: ConnInfo): Promise<Response> {
@@ -145,8 +145,8 @@ async function handler(req: Request, _connInfo: ConnInfo): Promise<Response> {
     let allowedOrigin = "null";
 
     const allowedOriginsList = [
-        "http://localhost:8000", // For local development of the frontend
-        "https://gemini2-ashen.vercel.app" // Your Vercel frontend
+        "http://localhost:8000",
+        "https://gemini2-ashen.vercel.app"
     ];
 
     if (requestOrigin && allowedOriginsList.includes(requestOrigin)) {
@@ -233,7 +233,7 @@ async function handler(req: Request, _connInfo: ConnInfo): Promise<Response> {
                         continue;
                     }
 
-                    const imageBuffer = await imageResponse.arrayBuffer(); // This is a Uint8Array
+                    const imageBuffer = await imageResponse.arrayBuffer(); // This is an ArrayBuffer
                     const base64Data = customEncodeToString(imageBuffer); // Use the updated function
 
                     if (textSegments.length > 0) {
@@ -305,16 +305,13 @@ async function handler(req: Request, _connInfo: ConnInfo): Promise<Response> {
 
     console.log(`[${new Date().toISOString()}] Original userParts received by proxy:`, JSON.stringify(userParts));
     console.log(`[${new Date().toISOString()}] Forwarding to Google API. Processed user parts:`, JSON.stringify(processedUserParts));
-    // For very detailed debugging, you can log the entire payload, but be mindful of large base64 strings
-    // console.log(`[${new Date().toISOString()}] Full payload to Google:`, JSON.stringify(payload));
-
 
     try {
         const googleApiResponse = await fetch(googleApiEndpoint, {
             method: 'POST',
             headers: { 'Content-Type': 'application/json' },
             body: JSON.stringify(payload),
-            signal: AbortSignal.timeout(90000) // 90-second timeout
+            signal: AbortSignal.timeout(90000)
         });
 
         if (!googleApiResponse.ok || !googleApiResponse.body) {
