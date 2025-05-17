@@ -1,5 +1,4 @@
 import { type ConnInfo, serve } from "https://deno.land/std@0.224.0/http/server.ts";
-import * as base64 from "https://deno.land/std@0.224.0/encoding/base64.ts";
 import { type SafetySetting, type GenerationConfig } from "npm:@google/generative-ai";
 
 interface TextPart {
@@ -127,8 +126,15 @@ function isValidPart(part: unknown): part is Part {
 }
 
 function customEncodeToString(src: Uint8Array | string): string {
-  const localDecoder = new TextDecoder();
-  return localDecoder.decode(base64.encode(src));
+  if (typeof src === 'string') {
+    return btoa(src); // Directly use btoa if the input is already a string
+  }
+  // If the input is Uint8Array, convert it to a binary string first
+  let bin = '';
+  src.forEach((byte) => { // Iterate over each byte in the Uint8Array
+    bin += String.fromCharCode(byte); // Convert the byte to its character representation
+  });
+  return btoa(bin); // Then, Base64 encode the binary string
 }
 
 async function handler(req: Request, _connInfo: ConnInfo): Promise<Response> {
@@ -139,8 +145,8 @@ async function handler(req: Request, _connInfo: ConnInfo): Promise<Response> {
     let allowedOrigin = "null";
 
     const allowedOriginsList = [
-        "http://localhost:8000",
-        "https://gemini2-ashen.vercel.app"
+        "http://localhost:8000", // For local development of the frontend
+        "https://gemini2-ashen.vercel.app" // Your Vercel frontend
     ];
 
     if (requestOrigin && allowedOriginsList.includes(requestOrigin)) {
@@ -227,8 +233,8 @@ async function handler(req: Request, _connInfo: ConnInfo): Promise<Response> {
                         continue;
                     }
 
-                    const imageBuffer = await imageResponse.arrayBuffer();
-                    const base64Data = customEncodeToString(imageBuffer);
+                    const imageBuffer = await imageResponse.arrayBuffer(); // This is a Uint8Array
+                    const base64Data = customEncodeToString(imageBuffer); // Use the updated function
 
                     if (textSegments.length > 0) {
                         const combinedTextSegment = textSegments.join("").trim();
@@ -259,13 +265,16 @@ async function handler(req: Request, _connInfo: ConnInfo): Promise<Response> {
     if (!model || typeof model !== 'string') {
         return new Response(JSON.stringify({ error: "Missing or invalid required field: model (string)" }), { status: 400, headers: { ...corsHeaders, 'Content-Type': 'application/json' } });
     }
-    if (!Array.isArray(userParts) || userParts.length === 0) {
-        return new Response(JSON.stringify({ error: "Missing or invalid required field: parts (non-empty array)" }), { status: 400, headers: { ...corsHeaders, 'Content-Type': 'application/json' } });
+    // Validate userParts *after* processing, as processedUserParts might be empty if only an image was sent and failed to process
+    if (processedUserParts.length === 0 && (!userParts || userParts.length === 0 || !userParts.some(p => p.text && p.text.trim() !== ''))) {
+        return new Response(JSON.stringify({ error: "Missing or invalid required field: parts (non-empty array after processing)" }), { status: 400, headers: { ...corsHeaders, 'Content-Type': 'application/json' } });
     }
-    if (!userParts.every(isValidPart)) {
+    // Original userParts validation (can be kept for sanity check or removed if processedUserParts validation is sufficient)
+    if (!Array.isArray(userParts) || !userParts.every(isValidPart)) {
          console.error("Bad Request: Invalid structure in original user parts array", userParts);
          return new Response(JSON.stringify({ error: "Invalid structure in original parts array. Each part must contain valid 'text', 'inlineData', or 'fileData'." }), { status: 400, headers: { ...corsHeaders, 'Content-Type': 'application/json' } });
     }
+
     if (!Array.isArray(history)) {
          return new Response(JSON.stringify({ error: "Missing or invalid required field: history (array)" }), { status: 400, headers: { ...corsHeaders, 'Content-Type': 'application/json' } });
     }
@@ -287,21 +296,25 @@ async function handler(req: Request, _connInfo: ConnInfo): Promise<Response> {
 
     const payload = {
         contents: [
-            ...history,
-            { role: "user", parts: userParts }
+            ...history, // Consider processing history parts for images too if needed
+            { role: "user", parts: processedUserParts.length > 0 ? processedUserParts : userParts } // Use processed parts
         ],
         ...(generationConfig && { generationConfig }),
         ...(safetySettings && { safetySettings }),
     };
 
-    console.log(`[${new Date().toISOString()}] Forwarding to Google API (Streaming): ${googleApiEndpoint.split('?')[0]} for model ${model} with ${userParts.length} user parts.`);
+    console.log(`[${new Date().toISOString()}] Original userParts received by proxy:`, JSON.stringify(userParts));
+    console.log(`[${new Date().toISOString()}] Forwarding to Google API. Processed user parts:`, JSON.stringify(processedUserParts));
+    // For very detailed debugging, you can log the entire payload, but be mindful of large base64 strings
+    // console.log(`[${new Date().toISOString()}] Full payload to Google:`, JSON.stringify(payload));
+
 
     try {
         const googleApiResponse = await fetch(googleApiEndpoint, {
             method: 'POST',
             headers: { 'Content-Type': 'application/json' },
             body: JSON.stringify(payload),
-            signal: AbortSignal.timeout(90000)
+            signal: AbortSignal.timeout(90000) // 90-second timeout
         });
 
         if (!googleApiResponse.ok || !googleApiResponse.body) {
