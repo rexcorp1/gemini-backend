@@ -1,24 +1,22 @@
-// main.ts
-
 import { type ConnInfo, serve } from "https://deno.land/std@0.224.0/http/server.ts";
+import { encodeToString } from "https://deno.land/std@0.224.0/encoding/base64.ts";
 import { type SafetySetting, type GenerationConfig } from "npm:@google/generative-ai";
 
-// --- Definisi Tipe untuk Multimodal ---
 interface TextPart {
     text: string;
 }
 
 interface InlineDataPart {
     inlineData: {
-        mimeType: string; // e.g., "image/png", "image/jpeg"
-        data: string;     // Base64 encoded string
+        mimeType: string;
+        data: string;
     };
 }
 
 interface FileDataPart {
     fileData: {
-        mimeType: string; // e.g., "audio/wav", "video/mp4"
-        fileUri: string;  // URI dari file yang diunggah (via File API atau GCS)
+        mimeType: string;
+        fileUri: string;
     };
 }
 
@@ -34,15 +32,15 @@ interface ChatRequestBody {
 
 interface GoogleApiResponseChunk {
     candidates?: {
-      content?: {
-        parts?: TextPart[];
-      };
-      finishReason?: string;
-      safetyRatings?: { category: string; probability: string }[];
+        content?: {
+            parts?: TextPart[];
+        };
+        finishReason?: string;
+        safetyRatings?: { category: string; probability: string }[];
     }[];
     promptFeedback?: {
-      blockReason?: string;
-      safetyRatings?: { category: string; probability: string }[];
+        blockReason?: string;
+        safetyRatings?: { category: string; probability: string }[];
     };
 }
 
@@ -98,7 +96,7 @@ async function* processGoogleStream(stream: ReadableStream<Uint8Array>): AsyncGe
                     if (textChunk !== null && textChunk !== undefined) {
                         yield textChunk;
                     } else {
-                         console.warn(`[${new Date().toISOString()}] Streaming finished with unprocessed buffer remnant (not valid data):`, buffer.trim());
+                        console.warn(`[${new Date().toISOString()}] Streaming finished with unprocessed buffer remnant (not valid data):`, buffer.trim());
                     }
                 }
                 break;
@@ -116,15 +114,15 @@ function isValidPart(part: unknown): part is Part {
     if (typeof part !== 'object' || part === null) return false;
     const hasText = 'text' in part && typeof (part as TextPart).text === 'string';
     const hasInlineData = 'inlineData' in part &&
-                          typeof (part as InlineDataPart).inlineData === 'object' &&
-                          (part as InlineDataPart).inlineData !== null &&
-                          typeof (part as InlineDataPart).inlineData.mimeType === 'string' &&
-                          typeof (part as InlineDataPart).inlineData.data === 'string';
+                            typeof (part as InlineDataPart).inlineData === 'object' &&
+                            (part as InlineDataPart).inlineData !== null &&
+                            typeof (part as InlineDataPart).inlineData.mimeType === 'string' &&
+                            typeof (part as InlineDataPart).inlineData.data === 'string';
     const hasFileData = 'fileData' in part &&
-                        typeof (part as FileDataPart).fileData === 'object' &&
-                        (part as FileDataPart).fileData !== null &&
-                        typeof (part as FileDataPart).fileData.mimeType === 'string' &&
-                        typeof (part as FileDataPart).fileData.fileUri === 'string';
+                            typeof (part as FileDataPart).fileData === 'object' &&
+                            (part as FileDataPart).fileData !== null &&
+                            typeof (part as FileDataPart).fileData.mimeType === 'string' &&
+                            typeof (part as FileDataPart).fileData.fileUri === 'string';
     return hasText || hasInlineData || hasFileData;
 }
 
@@ -132,13 +130,9 @@ async function handler(req: Request, _connInfo: ConnInfo): Promise<Response> {
     const requestStartTime = Date.now();
     console.log(`[${new Date(requestStartTime).toISOString()}] Received request: ${req.method} ${req.url}`);
 
-    // --- CORS Headers ---
-    // Untuk development, izinkan localhost. Untuk production, ganti dengan domain frontend lo.
-    // Atau baca dari environment variable.
     const requestOrigin = req.headers.get("origin");
-    let allowedOrigin = "null"; // Default jika origin tidak diizinkan atau tidak ada
+    let allowedOrigin = "null";
 
-    // Daftar origin yang diizinkan (bisa diperluas atau dibaca dari env var)
     const allowedOriginsList = [
         "http://localhost:8000",
         "https://gemini2-ashen.vercel.app"
@@ -151,10 +145,9 @@ async function handler(req: Request, _connInfo: ConnInfo): Promise<Response> {
     const corsHeaders = {
         'Access-Control-Allow-Origin': allowedOrigin,
         'Access-Control-Allow-Methods': 'POST, OPTIONS',
-        'Access-Control-Allow-Headers': 'Content-Type, Authorization', // Tambahkan header lain jika perlu
+        'Access-Control-Allow-Headers': 'Content-Type, Authorization',
     };
 
-    // Handle preflight OPTIONS request
     if (req.method === 'OPTIONS') {
         return new Response(null, { status: 204, headers: corsHeaders });
     }
@@ -195,6 +188,69 @@ async function handler(req: Request, _connInfo: ConnInfo): Promise<Response> {
 
     const { parts: userParts, history, model, generationConfig, safetySettings } = body;
 
+    const processedUserParts: Part[] = [];
+    const imageRefRegex = /\[File Ref: (https?:\/\/[^\]]+)\]/g;
+
+    for (const part of userParts) {
+        if (part.text) {
+            let lastIndex = 0;
+            let match;
+            const textSegments: string[] = [];
+            let originalTextForPart = part.text;
+
+            while ((match = imageRefRegex.exec(originalTextForPart)) !== null) {
+                if (match.index > lastIndex) {
+                    textSegments.push(originalTextForPart.substring(lastIndex, match.index));
+                }
+                const imageUrl = match[1];
+                lastIndex = imageRefRegex.lastIndex;
+
+                try {
+                    console.log(`[${new Date().toISOString()}] Fetching image from URL: ${imageUrl}`);
+                    const imageResponse = await fetch(imageUrl);
+
+                    if (!imageResponse.ok) {
+                        console.warn(`[${new Date().toISOString()}] Failed to fetch image ${imageUrl}: ${imageResponse.status}`);
+                        textSegments.push(` [Failed to load image: ${imageResponse.statusText}] `);
+                        continue;
+                    }
+
+                    const contentType = imageResponse.headers.get("content-type");
+                    if (!contentType || !contentType.startsWith("image/")) {
+                        console.warn(`[${new Date().toISOString()}] Fetched content from ${imageUrl} is not an image: ${contentType}`);
+                        textSegments.push(` [Invalid image content: ${contentType}] `);
+                        continue;
+                    }
+
+                    const imageBuffer = await imageResponse.arrayBuffer();
+                    const base64Data = encodeToString(imageBuffer);
+
+                    if (textSegments.length > 0) {
+                        const combinedTextSegment = textSegments.join("").trim();
+                        if (combinedTextSegment) processedUserParts.push({ text: combinedTextSegment });
+                        textSegments.length = 0;
+                    }
+
+                    processedUserParts.push({
+                        inlineData: { mimeType: contentType, data: base64Data },
+                    });
+                } catch (fetchError) {
+                    console.error(`[${new Date().toISOString()}] Error fetching or processing image ${imageUrl}:`, fetchError);
+                    textSegments.push(` [Error processing image: ${fetchError.message}] `);
+                }
+            }
+            if (lastIndex < originalTextForPart.length) {
+                textSegments.push(originalTextForPart.substring(lastIndex));
+            }
+            if (textSegments.length > 0) {
+                const finalTextSegment = textSegments.join("").trim();
+                if (finalTextSegment) processedUserParts.push({ text: finalTextSegment });
+            }
+        } else {
+            processedUserParts.push(part);
+        }
+    }
+
     if (!model || typeof model !== 'string') {
         return new Response(JSON.stringify({ error: "Missing or invalid required field: model (string)" }), { status: 400, headers: { ...corsHeaders, 'Content-Type': 'application/json' } });
     }
@@ -202,8 +258,8 @@ async function handler(req: Request, _connInfo: ConnInfo): Promise<Response> {
         return new Response(JSON.stringify({ error: "Missing or invalid required field: parts (non-empty array)" }), { status: 400, headers: { ...corsHeaders, 'Content-Type': 'application/json' } });
     }
     if (!userParts.every(isValidPart)) {
-         console.error("Bad Request: Invalid structure in user parts array", userParts);
-         return new Response(JSON.stringify({ error: "Invalid structure in parts array. Each part must contain valid 'text', 'inlineData', or 'fileData'." }), { status: 400, headers: { ...corsHeaders, 'Content-Type': 'application/json' } });
+         console.error("Bad Request: Invalid structure in original user parts array", userParts);
+         return new Response(JSON.stringify({ error: "Invalid structure in original parts array. Each part must contain valid 'text', 'inlineData', or 'fileData'." }), { status: 400, headers: { ...corsHeaders, 'Content-Type': 'application/json' } });
     }
     if (!Array.isArray(history)) {
          return new Response(JSON.stringify({ error: "Missing or invalid required field: history (array)" }), { status: 400, headers: { ...corsHeaders, 'Content-Type': 'application/json' } });
@@ -244,17 +300,17 @@ async function handler(req: Request, _connInfo: ConnInfo): Promise<Response> {
         });
 
         if (!googleApiResponse.ok || !googleApiResponse.body) {
-             let errorBodyText = await googleApiResponse.text();
-             let errorJson = null;
-             let errorMessage = googleApiResponse.statusText;
-             try {
-                 errorJson = JSON.parse(errorBodyText);
-                 errorMessage = errorJson?.error?.message || errorMessage;
-                 console.error(`[${new Date().toISOString()}] Google API Error (${googleApiResponse.status}):`, errorJson);
-             } catch (e) {
-                 console.error(`[${new Date().toISOString()}] Google API Error (${googleApiResponse.status}): ${errorBodyText || '<empty body>'}`);
-                 if (errorBodyText) errorMessage = errorBodyText;
-             }
+            let errorBodyText = await googleApiResponse.text();
+            let errorJson = null;
+            let errorMessage = googleApiResponse.statusText;
+            try {
+                errorJson = JSON.parse(errorBodyText);
+                errorMessage = errorJson?.error?.message || errorMessage;
+                console.error(`[${new Date().toISOString()}] Google API Error (${googleApiResponse.status}):`, errorJson);
+            } catch (e) {
+                console.error(`[${new Date().toISOString()}] Google API Error (${googleApiResponse.status}): ${errorBodyText || '<empty body>'}`);
+                if (errorBodyText) errorMessage = errorBodyText;
+            }
             return new Response(JSON.stringify({ error: `Google API Error: ${errorMessage}` }), {
                 status: googleApiResponse.status,
                 headers: { ...corsHeaders, 'Content-Type': 'application/json' },
@@ -275,17 +331,17 @@ async function handler(req: Request, _connInfo: ConnInfo): Promise<Response> {
                     const streamEndTime = Date.now();
                     console.log(`[${new Date().toISOString()}] Deno response stream closed successfully for model ${model}. Processing time: ${streamEndTime - streamStartTime}ms`);
                 } catch (streamError) {
-                     const streamEndTime = Date.now();
-                     console.error(`[${new Date().toISOString()}] Error processing Google stream or writing to response:`, streamError, `Stream active for ${streamEndTime - streamStartTime}ms`);
-                     if (controller.desiredSize === null || (controller.desiredSize && controller.desiredSize > 0)) { // Perbaikan kondisi
-                         try {
-                             const errorMsg = `\n[STREAM_ERROR] Processing failed: ${streamError.message}\n`;
-                             controller.enqueue(new TextEncoder().encode(errorMsg));
-                         } catch (enqueueError) {
-                             console.error("Failed to enqueue stream error message:", enqueueError);
-                         }
-                     }
-                     controller.error(streamError);
+                        const streamEndTime = Date.now();
+                        console.error(`[${new Date().toISOString()}] Error processing Google stream or writing to response:`, streamError, `Stream active for ${streamEndTime - streamStartTime}ms`);
+                        if (controller.desiredSize === null || (controller.desiredSize && controller.desiredSize > 0)) {
+                            try {
+                                const errorMsg = `\n[STREAM_ERROR] Processing failed: ${streamError.message}\n`;
+                                controller.enqueue(new TextEncoder().encode(errorMsg));
+                            } catch (enqueueError) {
+                                console.error("Failed to enqueue stream error message:", enqueueError);
+                            }
+                        }
+                        controller.error(streamError);
                 }
             }
         });
@@ -308,19 +364,3 @@ async function handler(req: Request, _connInfo: ConnInfo): Promise<Response> {
 
         if (error.name === 'TimeoutError') {
             status = 504;
-            message = 'Request to Google API timed out.';
-        } else if (error.message.startsWith('Stream stopped by API due to:') || error.message.startsWith('Request blocked by API due to:')) {
-             status = 400;
-             message = error.message;
-         }
-
-        return new Response(JSON.stringify({ error: message }), {
-            status: status,
-            headers: { ...corsHeaders, 'Content-Type': 'application/json' },
-        });
-    }
-}
-
-const port = 8000; // Pastikan port ini tidak konflik dengan port frontend (jika dijalankan di mesin yang sama)
-console.log(`Chat server starting on http://localhost:${port}`);
-serve(handler, { port });
