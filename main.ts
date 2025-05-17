@@ -1,25 +1,22 @@
-// main.ts
-
 import { type ConnInfo, serve } from "https://deno.land/std@0.224.0/http/server.ts";
-import { encodeToString } from "https://deno.land/std@0.224.0/encoding/base64.ts";
+import { encode as base64Encode } from "https://deno.land/std@0.224.0/encoding/base64.ts";
 import { type SafetySetting, type GenerationConfig } from "npm:@google/generative-ai";
 
-// --- Definisi Tipe untuk Multimodal ---
 interface TextPart {
     text: string;
 }
 
 interface InlineDataPart {
     inlineData: {
-        mimeType: string; // e.g., "image/png", "image/jpeg"
-        data: string;     // Base64 encoded string
+        mimeType: string;
+        data: string;
     };
 }
 
 interface FileDataPart {
     fileData: {
-        mimeType: string; // e.g., "audio/wav", "video/mp4"
-        fileUri: string;  // URI dari file yang diunggah (via File API atau GCS)
+        mimeType: string;
+        fileUri: string;
     };
 }
 
@@ -129,17 +126,18 @@ function isValidPart(part: unknown): part is Part {
     return hasText || hasInlineData || hasFileData;
 }
 
+function customEncodeToString(src: Uint8Array | string): string {
+  const localDecoder = new TextDecoder();
+  return localDecoder.decode(base64Encode(src));
+}
+
 async function handler(req: Request, _connInfo: ConnInfo): Promise<Response> {
     const requestStartTime = Date.now();
     console.log(`[${new Date(requestStartTime).toISOString()}] Received request: ${req.method} ${req.url}`);
 
-    // --- CORS Headers ---
-    // Untuk development, izinkan localhost. Untuk production, ganti dengan domain frontend lo.
-    // Atau baca dari environment variable.
     const requestOrigin = req.headers.get("origin");
-    let allowedOrigin = "null"; // Default jika origin tidak diizinkan atau tidak ada
+    let allowedOrigin = "null";
 
-    // Daftar origin yang diizinkan (bisa diperluas atau dibaca dari env var)
     const allowedOriginsList = [
         "http://localhost:8000",
         "https://gemini2-ashen.vercel.app"
@@ -152,10 +150,9 @@ async function handler(req: Request, _connInfo: ConnInfo): Promise<Response> {
     const corsHeaders = {
         'Access-Control-Allow-Origin': allowedOrigin,
         'Access-Control-Allow-Methods': 'POST, OPTIONS',
-        'Access-Control-Allow-Headers': 'Content-Type, Authorization', // Tambahkan header lain jika perlu
+        'Access-Control-Allow-Headers': 'Content-Type, Authorization',
     };
 
-    // Handle preflight OPTIONS request
     if (req.method === 'OPTIONS') {
         return new Response(null, { status: 204, headers: corsHeaders });
     }
@@ -196,25 +193,22 @@ async function handler(req: Request, _connInfo: ConnInfo): Promise<Response> {
 
     const { parts: userParts, history, model, generationConfig, safetySettings } = body;
 
-    // --- MODIFIKASI UNTUK MEMPROSES GAMBAR DARI URL ---
     const processedUserParts: Part[] = [];
-    const imageRefRegex = /\[File Ref: (https?:\/\/[^\]]+)\]/g; // Regex untuk [File Ref: URL]
+    const imageRefRegex = /\[File Ref: (https?:\/\/[^\]]+)\]/g;
 
     for (const part of userParts) {
         if (part.text) {
             let lastIndex = 0;
             let match;
-            const textSegments: string[] = []; // Untuk menampung potongan teks
-            let originalTextForPart = part.text; // Simpan teks asli untuk diproses
+            const textSegments: string[] = [];
+            let originalTextForPart = part.text;
 
-            // Cari semua kemunculan [File Ref: URL]
             while ((match = imageRefRegex.exec(originalTextForPart)) !== null) {
-                // Tambahkan teks sebelum [File Ref: URL]
                 if (match.index > lastIndex) {
                     textSegments.push(originalTextForPart.substring(lastIndex, match.index));
                 }
-                const imageUrl = match[1]; // URL gambar
-                lastIndex = imageRefRegex.lastIndex; // Update lastIndex untuk iterasi berikutnya
+                const imageUrl = match[1];
+                lastIndex = imageRefRegex.lastIndex;
 
                 try {
                     console.log(`[${new Date().toISOString()}] Fetching image from URL: ${imageUrl}`);
@@ -222,7 +216,7 @@ async function handler(req: Request, _connInfo: ConnInfo): Promise<Response> {
 
                     if (!imageResponse.ok) {
                         console.warn(`[${new Date().toISOString()}] Failed to fetch image ${imageUrl}: ${imageResponse.status}`);
-                        textSegments.push(` [Failed to load image: ${imageResponse.statusText}] `); // Tambahkan pesan error ke teks
+                        textSegments.push(` [Failed to load image: ${imageResponse.statusText}] `);
                         continue;
                     }
 
@@ -234,13 +228,12 @@ async function handler(req: Request, _connInfo: ConnInfo): Promise<Response> {
                     }
 
                     const imageBuffer = await imageResponse.arrayBuffer();
-                    const base64Data = encodeToString(imageBuffer); // Konversi ArrayBuffer ke base64
+                    const base64Data = customEncodeToString(imageBuffer);
 
-                    // Jika ada teks terkumpul sebelumnya, tambahkan sebagai TextPart
                     if (textSegments.length > 0) {
                         const combinedTextSegment = textSegments.join("").trim();
                         if (combinedTextSegment) processedUserParts.push({ text: combinedTextSegment });
-                        textSegments.length = 0; // Kosongkan lagi
+                        textSegments.length = 0;
                     }
 
                     processedUserParts.push({
@@ -251,7 +244,6 @@ async function handler(req: Request, _connInfo: ConnInfo): Promise<Response> {
                     textSegments.push(` [Error processing image: ${fetchError.message}] `);
                 }
             }
-            // Tambahkan sisa teks setelah [File Ref: URL] terakhir (atau seluruh teks jika tidak ada match)
             if (lastIndex < originalTextForPart.length) {
                 textSegments.push(originalTextForPart.substring(lastIndex));
             }
@@ -259,11 +251,10 @@ async function handler(req: Request, _connInfo: ConnInfo): Promise<Response> {
                 const finalTextSegment = textSegments.join("").trim();
                 if (finalTextSegment) processedUserParts.push({ text: finalTextSegment });
             }
-        } else { // Jika bukan TextPart (misal sudah InlineDataPart dari client), langsung tambahkan
+        } else {
             processedUserParts.push(part);
         }
     }
-    // --- AKHIR MODIFIKASI ---
 
     if (!model || typeof model !== 'string') {
         return new Response(JSON.stringify({ error: "Missing or invalid required field: model (string)" }), { status: 400, headers: { ...corsHeaders, 'Content-Type': 'application/json' } });
@@ -347,7 +338,7 @@ async function handler(req: Request, _connInfo: ConnInfo): Promise<Response> {
                 } catch (streamError) {
                      const streamEndTime = Date.now();
                      console.error(`[${new Date().toISOString()}] Error processing Google stream or writing to response:`, streamError, `Stream active for ${streamEndTime - streamStartTime}ms`);
-                     if (controller.desiredSize === null || (controller.desiredSize && controller.desiredSize > 0)) { // Perbaikan kondisi
+                     if (controller.desiredSize === null || (controller.desiredSize && controller.desiredSize > 0)) {
                          try {
                              const errorMsg = `\n[STREAM_ERROR] Processing failed: ${streamError.message}\n`;
                              controller.enqueue(new TextEncoder().encode(errorMsg));
@@ -391,6 +382,6 @@ async function handler(req: Request, _connInfo: ConnInfo): Promise<Response> {
     }
 }
 
-const port = 8000; // Pastikan port ini tidak konflik dengan port frontend (jika dijalankan di mesin yang sama)
+const port = 8000;
 console.log(`Chat server starting on http://localhost:${port}`);
 serve(handler, { port });
